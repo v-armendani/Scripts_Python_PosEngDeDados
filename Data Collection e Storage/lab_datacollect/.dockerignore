@@ -1,0 +1,7 @@
+# O build só precisa do requirements.txt; o resto é montado em tempo de execução.
+# Mantém segredos e arquivos grandes fora do contexto de build.
+.env
+.venv/
+data/
+**/__pycache__/
+.ipynb_checkpoints/

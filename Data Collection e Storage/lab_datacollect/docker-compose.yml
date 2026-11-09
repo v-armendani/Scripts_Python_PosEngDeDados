@@ -1,0 +1,211 @@
+name: lab-datacollect
+
+# Versões fixadas. As imagens Chainguard só publicam "latest"/"latest-dev" no
+# plano gratuito, por isso são fixadas por digest (sha256) em vez de tag.
+
+services:
+  # ---------------------------------------------------------------------------
+  # Origem relacional com replicação lógica habilitada (cenários 1, 2 e 3)
+  # ---------------------------------------------------------------------------
+  postgres:
+    container_name: lab-postgres
+    image: postgres:17.6
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_senders=10
+      # Protege o disco: um slot abandonado não retém WAL além deste limite
+      - -c
+      - max_slot_wal_keep_size=2GB
+      # Encoding padrão para clientes que não informam o seu (ex.: psql no Windows)
+      - -c
+      - client_encoding=UTF8
+    environment:
+      # Só tem efeito na criação do volume: banco em UTF8 com ordenação ICU pt-BR
+      # (acentos ordenados como no português: "Álvaro" junto de "Alberto").
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8 --locale-provider=icu --icu-locale=pt-BR"
+      POSTGRES_USER: ${POSTGRES_USER:?defina POSTGRES_USER no .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD no .env}
+      POSTGRES_DB: ${POSTGRES_DB:?defina POSTGRES_DB no .env}
+      CDC_USER: ${CDC_USER:?defina CDC_USER no .env}
+      CDC_PASSWORD: ${CDC_PASSWORD:?defina CDC_PASSWORD no .env}
+      CDC_PUBLICATION: ${CDC_PUBLICATION:?defina CDC_PUBLICATION no .env}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Todo .sql/.sh da pasta sql/ é executado em ordem alfabética, só na
+      # 1ª inicialização (volume vazio): 01_cdc_setup.sh e 02_schema.sql.
+      # Atenção: não salve consultas avulsas em sql/, elas também rodariam aqui.
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Object storage S3-compatível (Bronze / Silver)
+  # ---------------------------------------------------------------------------
+  minio:
+    container_name: lab-minio
+    image: chainguard/minio:latest-dev@sha256:7037aec11fc0069d877e70bfb2387cf23f20fe0d14d9cf86cacf9b8440395416
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?defina MINIO_ROOT_USER no .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?defina MINIO_ROOT_PASSWORD no .env}
+    ports:
+      - "127.0.0.1:${MINIO_API_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # Job one-shot: cria os buckets de forma idempotente e encerra
+  minio-init:
+    container_name: lab-minio-init
+    image: chainguard/minio-client:latest-dev@sha256:20d1b2a39ca3b69ce970235e5940c99d0e1c840d2769c16ca1df540f5e17e956
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET_BRONZE: ${MINIO_BUCKET_BRONZE:?defina MINIO_BUCKET_BRONZE no .env}
+      MINIO_BUCKET_SILVER: ${MINIO_BUCKET_SILVER:?defina MINIO_BUCKET_SILVER no .env}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"
+        mc mb --ignore-existing "local/$${MINIO_BUCKET_BRONZE}"
+        mc mb --ignore-existing "local/$${MINIO_BUCKET_SILVER}"
+        mc ls local
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Kafka em modo KRaft (nó único: broker + controller, sem Zookeeper)
+  # ---------------------------------------------------------------------------
+  kafka:
+    container_name: lab-kafka
+    image: apache/kafka:3.9.1
+    environment:
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:?defina KAFKA_CLUSTER_ID no .env}
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # PLAINTEXT: tráfego interno (Kafka Connect); PLAINTEXT_HOST: clientes no host
+      KAFKA_LISTENERS: PLAINTEXT://:29092,CONTROLLER://:29093,PLAINTEXT_HOST://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://127.0.0.1:${KAFKA_PORT:-9092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    ports:
+      - "127.0.0.1:${KAFKA_PORT:-9092}:9092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:29092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Kafka Connect com conectores Debezium (cenário 3)
+  # ---------------------------------------------------------------------------
+  connect:
+    container_name: lab-connect
+    image: quay.io/debezium/connect:3.2.3.Final
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      GROUP_ID: lab-connect
+      CONFIG_STORAGE_TOPIC: _connect_configs
+      OFFSET_STORAGE_TOPIC: _connect_offsets
+      STATUS_STORAGE_TOPIC: _connect_statuses
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      # Permite referenciar ${env:CDC_PASSWORD} no JSON do conector,
+      # sem gravar a senha na configuração armazenada no Kafka
+      CONNECT_CONFIG_PROVIDERS: env
+      CONNECT_CONFIG_PROVIDERS_ENV_CLASS: org.apache.kafka.common.config.provider.EnvVarConfigProvider
+      CDC_USER: ${CDC_USER}
+      CDC_PASSWORD: ${CDC_PASSWORD}
+    ports:
+      - "127.0.0.1:${KAFKA_CONNECT_PORT:-8083}:8083"
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8083/connectors"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Ambiente Python (scripts dos cenários + Jupyter)
+  # ---------------------------------------------------------------------------
+  python:
+    container_name: lab-python
+    build: .
+    image: lab-datacollect-python:1.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+      connect:
+        condition: service_healthy
+    # O .env (montado junto com o projeto) vale para quem roda no host. Aqui
+    # dentro os serviços são acessados pelo nome na rede do compose; variáveis
+    # de ambiente têm prioridade sobre o .env, então estas sobrescrevem as dele.
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      S3_ENDPOINT_URL: http://minio:9000
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_CONNECT_URL: http://connect:8083
+    command:
+      - jupyter
+      - lab
+      - --ip=0.0.0.0
+      - --port=8888
+      - --no-browser
+      - --ServerApp.root_dir=/app
+      - --IdentityProvider.token=${JUPYTER_TOKEN:?defina JUPYTER_TOKEN no .env}
+    ports:
+      - "127.0.0.1:${JUPYTER_PORT:-8888}:8888"
+    volumes:
+      - ./:/app
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8888/api', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  minio_data:
+  kafka_data:

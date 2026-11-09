@@ -1,0 +1,12 @@
+# Segredos
+.env
+
+# Dados locais (catálogo Iceberg SQLite, extrações). Só a pasta é versionada.
+data/*
+!data/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.ipynb_checkpoints/

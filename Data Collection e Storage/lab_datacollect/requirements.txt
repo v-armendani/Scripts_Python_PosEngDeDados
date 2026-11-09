@@ -1,0 +1,17 @@
+# Origem relacional (populate)
+psycopg2-binary==2.9.13
+Faker==40.45.0
+python-dotenv==1.2.4
+
+# Processamento e formatos (cenários 1, 2 e 4)
+pandas==3.1.1
+pyarrow==26.0.1
+
+# Lakehouse Iceberg com catálogo SQLite (cenário 4)
+pyiceberg[sql-sqlite,pyarrow]==0.12.0
+
+# Consumer Kafka (cenário 3)
+confluent-kafka==2.16.1
+
+# Notebooks
+jupyterlab==4.6.6
